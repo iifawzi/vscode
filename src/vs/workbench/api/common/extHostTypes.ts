@@ -13,12 +13,11 @@ import { nextCharLength } from 'vs/base/common/strings';
 import { isNumber, isObject, isString, isStringArray } from 'vs/base/common/types';
 import { URI } from 'vs/base/common/uri';
 import { generateUuid } from 'vs/base/common/uuid';
-import { IExtensionDescription } from 'vs/platform/extensions/common/extensions';
+import { ExtensionIdentifier, IExtensionDescription } from 'vs/platform/extensions/common/extensions';
 import { FileSystemProviderErrorCode, markAsFileSystemProviderError } from 'vs/platform/files/common/files';
 import { RemoteAuthorityResolverErrorCode } from 'vs/platform/remote/common/remoteAuthorityResolver';
 import { IRelativePatternDto } from 'vs/workbench/api/common/extHost.protocol';
-import { CellEditType, ICellPartialMetadataEdit, IDocumentMetadataEdit, isTextStreamMime } from 'vs/workbench/contrib/notebook/common/notebookCommon';
-import { checkProposedApiEnabled } from 'vs/workbench/services/extensions/common/extensions';
+import { CellEditType, ICellMetadataEdit, IDocumentMetadataEdit, isTextStreamMime } from 'vs/workbench/contrib/notebook/common/notebookCommon';
 import type * as vscode from 'vscode';
 
 /**
@@ -479,7 +478,22 @@ export class Selection extends Range {
 	}
 }
 
+const validateConnectionToken = (connectionToken: string) => {
+	if (typeof connectionToken !== 'string' || connectionToken.length === 0 || !/^[0-9A-Za-z_\-]+$/.test(connectionToken)) {
+		throw illegalArgument('connectionToken');
+	}
+};
+
+
 export class ResolvedAuthority {
+	public static isResolvedAuthority(resolvedAuthority: any): resolvedAuthority is ResolvedAuthority {
+		return resolvedAuthority
+			&& typeof resolvedAuthority === 'object'
+			&& typeof resolvedAuthority.host === 'string'
+			&& typeof resolvedAuthority.port === 'number'
+			&& (resolvedAuthority.connectionToken === undefined || typeof resolvedAuthority.connectionToken === 'string');
+	}
+
 	readonly host: string;
 	readonly port: number;
 	readonly connectionToken: string | undefined;
@@ -492,13 +506,28 @@ export class ResolvedAuthority {
 			throw illegalArgument('port');
 		}
 		if (typeof connectionToken !== 'undefined') {
-			if (typeof connectionToken !== 'string' || connectionToken.length === 0 || !/^[0-9A-Za-z_\-]+$/.test(connectionToken)) {
-				throw illegalArgument('connectionToken');
-			}
+			validateConnectionToken(connectionToken);
 		}
 		this.host = host;
 		this.port = Math.round(port);
 		this.connectionToken = connectionToken;
+	}
+}
+
+
+export class ManagedResolvedAuthority {
+
+	public static isManagedResolvedAuthority(resolvedAuthority: any): resolvedAuthority is ManagedResolvedAuthority {
+		return resolvedAuthority
+			&& typeof resolvedAuthority === 'object'
+			&& typeof resolvedAuthority.makeConnection === 'function'
+			&& (resolvedAuthority.connectionToken === undefined || typeof resolvedAuthority.connectionToken === 'string');
+	}
+
+	constructor(public readonly makeConnection: () => Thenable<vscode.ManagedMessagePassing>, public readonly connectionToken?: string) {
+		if (typeof connectionToken !== 'undefined') {
+			validateConnectionToken(connectionToken);
+		}
 	}
 }
 
@@ -745,7 +774,7 @@ export interface IFileSnippetTextEdit {
 export interface IFileCellEdit {
 	readonly _type: FileEditType.Cell;
 	readonly uri: URI;
-	readonly edit?: ICellPartialMetadataEdit | IDocumentMetadataEdit;
+	readonly edit?: ICellMetadataEdit | IDocumentMetadataEdit;
 	readonly notebookMetadata?: Record<string, any>;
 	readonly metadata?: vscode.WorkspaceEditEntryMetadata;
 }
@@ -802,7 +831,7 @@ export class WorkspaceEdit implements vscode.WorkspaceEdit {
 	}
 
 	private replaceNotebookCellMetadata(uri: URI, index: number, cellMetadata: Record<string, any>, metadata?: vscode.WorkspaceEditEntryMetadata): void {
-		this._edits.push({ _type: FileEditType.Cell, metadata, uri, edit: { editType: CellEditType.PartialMetadata, index, metadata: cellMetadata } });
+		this._edits.push({ _type: FileEditType.Cell, metadata, uri, edit: { editType: CellEditType.Metadata, index, metadata: cellMetadata } });
 	}
 
 	// --- text
@@ -992,7 +1021,7 @@ export class SnippetString {
 			defaultValue = nested.value;
 
 		} else if (typeof defaultValue === 'string') {
-			defaultValue = defaultValue.replace(/\$|}/g, '\\$&');
+			defaultValue = defaultValue.replace(/\$|}/g, '\\$&'); // CodeQL [SM02383] I do not want to escape backslashes here
 		}
 
 		this.value += '${';
@@ -1328,7 +1357,6 @@ export class CodeAction {
 	}
 }
 
-
 @es5ClassCompat
 export class CodeActionKind {
 	private static readonly sep = '.';
@@ -1343,6 +1371,7 @@ export class CodeActionKind {
 	public static Source: CodeActionKind;
 	public static SourceOrganizeImports: CodeActionKind;
 	public static SourceFixAll: CodeActionKind;
+	public static Notebook: CodeActionKind;
 
 	constructor(
 		public readonly value: string
@@ -1360,6 +1389,17 @@ export class CodeActionKind {
 		return this.value === other.value || other.value.startsWith(this.value + CodeActionKind.sep);
 	}
 }
+
+export class NotebookCodeActionKind extends CodeActionKind {
+	public static override Notebook: CodeActionKind;
+
+	constructor(
+		public override readonly value: string
+	) {
+		super(value);
+	}
+}
+
 CodeActionKind.Empty = new CodeActionKind('');
 CodeActionKind.QuickFix = CodeActionKind.Empty.append('quickfix');
 CodeActionKind.Refactor = CodeActionKind.Empty.append('refactor');
@@ -1370,6 +1410,7 @@ CodeActionKind.RefactorRewrite = CodeActionKind.Refactor.append('rewrite');
 CodeActionKind.Source = CodeActionKind.Empty.append('source');
 CodeActionKind.SourceOrganizeImports = CodeActionKind.Source.append('organizeImports');
 CodeActionKind.SourceFixAll = CodeActionKind.Source.append('fixAll');
+CodeActionKind.Notebook = CodeActionKind.Empty.append('notebook');
 
 @es5ClassCompat
 export class SelectionRange {
@@ -1755,6 +1796,10 @@ export enum ViewColumn {
 export enum StatusBarAlignment {
 	Left = 1,
 	Right = 2
+}
+
+export function asStatusBarItemIdentifier(extension: ExtensionIdentifier, id: string): string {
+	return `${ExtensionIdentifier.toKey(extension)}.${id}`;
 }
 
 export enum TextEditorLineNumbersStyle {
@@ -2496,10 +2541,9 @@ export class TreeItem {
 	checkboxState?: vscode.TreeItemCheckboxState;
 
 	static isTreeItem(thing: any, extension: IExtensionDescription): thing is TreeItem {
-		const treeItemThing = thing as vscode.TreeItem2;
+		const treeItemThing = thing as vscode.TreeItem;
 
 		if (treeItemThing.checkboxState !== undefined) {
-			checkProposedApiEnabled(extension, 'treeItemCheckbox');
 			const checkbox = isNumber(treeItemThing.checkboxState) ? treeItemThing.checkboxState :
 				isObject(treeItemThing.checkboxState) && isNumber(treeItemThing.checkboxState.state) ? treeItemThing.checkboxState.state : undefined;
 			const tooltip = !isNumber(treeItemThing.checkboxState) && isObject(treeItemThing.checkboxState) ? treeItemThing.checkboxState.tooltip : undefined;
@@ -2943,6 +2987,24 @@ export class DebugAdapterInlineImplementation implements vscode.DebugAdapterInli
 		this.implementation = impl;
 	}
 }
+
+
+@es5ClassCompat
+export class StackFrameFocus {
+	constructor(
+		public readonly session: vscode.DebugSession,
+		readonly threadId?: number,
+		readonly frameId?: number) { }
+}
+
+@es5ClassCompat
+export class ThreadFocus {
+	constructor(
+		public readonly session: vscode.DebugSession,
+		readonly threadId?: number) { }
+}
+
+
 
 @es5ClassCompat
 export class EvaluatableExpression implements vscode.EvaluatableExpression {
@@ -3786,15 +3848,10 @@ export class LinkedEditingRanges {
 
 //#region ports
 export class PortAttributes {
-	private _port: number;
 	private _autoForwardAction: PortAutoForwardAction;
-	constructor(port: number, autoForwardAction: PortAutoForwardAction) {
-		this._port = port;
-		this._autoForwardAction = autoForwardAction;
-	}
 
-	get port(): number {
-		return this._port;
+	constructor(autoForwardAction: PortAutoForwardAction) {
+		this._autoForwardAction = autoForwardAction;
 	}
 
 	get autoForwardAction(): PortAutoForwardAction {

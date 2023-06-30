@@ -114,7 +114,18 @@ export class CopyPasteController extends Disposable implements IEditorContributi
 	}
 
 	private handleCopy(e: ClipboardEvent) {
-		if (!e.clipboardData || !this._editor.hasTextFocus() || !this.isPasteAsEnabled()) {
+		if (!this._editor.hasTextFocus()) {
+			return;
+		}
+
+		if (platform.isWeb) {
+			// Explicitly clear the web resources clipboard.
+			// This is needed because on web, the browser clipboard is faked out using an in-memory store.
+			// This means the resources clipboard is not properly updated when copying from the editor.
+			this._clipboardService.writeResources([]);
+		}
+
+		if (!e.clipboardData || !this.isPasteAsEnabled()) {
 			return;
 		}
 
@@ -165,8 +176,13 @@ export class CopyPasteController extends Disposable implements IEditorContributi
 		});
 
 		const promise = createCancelablePromise(async token => {
-			const results = coalesce(await Promise.all(providers.map(provider => {
-				return provider.prepareDocumentPaste!(model, ranges, dataTransfer, token);
+			const results = coalesce(await Promise.all(providers.map(async provider => {
+				try {
+					return await provider.prepareDocumentPaste!(model, ranges, dataTransfer, token);
+				} catch (err) {
+					console.error(err);
+					return undefined;
+				}
 			})));
 
 			// Values from higher priority providers should overwrite values from lower priority ones.
@@ -263,6 +279,12 @@ export class CopyPasteController extends Disposable implements IEditorContributi
 
 				const providerEdits = await this.getPasteEdits(supportedProviders, dataTransfer, model, selections, tokenSource.token);
 				if (tokenSource.token.isCancellationRequested) {
+					return;
+				}
+
+				// If the only edit returned is a text edit, use the default paste handler
+				if (providerEdits.length === 1 && providerEdits[0].id === 'text') {
+					await this.applyDefaultPasteHandler(dataTransfer, metadata, tokenSource.token);
 					return;
 				}
 
@@ -391,9 +413,14 @@ export class CopyPasteController extends Disposable implements IEditorContributi
 
 	private async getPasteEdits(providers: readonly DocumentPasteEditProvider[], dataTransfer: VSDataTransfer, model: ITextModel, selections: readonly Selection[], token: CancellationToken): Promise<DocumentPasteEdit[]> {
 		const result = await raceCancellation(
-			Promise.all(
-				providers.map(provider => provider.provideDocumentPasteEdits?.(model, selections, dataTransfer, token))
-			).then(coalesce),
+			Promise.all(providers.map(provider => {
+				try {
+					return provider.provideDocumentPasteEdits?.(model, selections, dataTransfer, token);
+				} catch (err) {
+					console.error(err);
+					return undefined;
+				}
+			})).then(coalesce),
 			token);
 		result?.sort((a, b) => b.priority - a.priority);
 		return result ?? [];
